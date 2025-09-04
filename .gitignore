@@ -42,3 +42,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Local venv
+.venv/
+# Logs
+*.log
