@@ -8,6 +8,7 @@ import re
 from openpyxl import load_workbook
 from openpyxl.workbook.workbook import Workbook
 from copy import copy
+from openpyxl.cell.cell import Cell
 
 
 def sanitize_sheet_name(sheet_name: str) -> str:
@@ -19,10 +20,25 @@ def sanitize_sheet_name(sheet_name: str) -> str:
     return sanitized[:255]
 
 
+def _is_formula_cell(cell: Cell) -> bool:
+    try:
+        if cell is None:
+            return False
+        if cell.data_type == 'f':
+            return True
+        if isinstance(cell.value, str) and cell.value.startswith('='):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def split_excel_to_zip(file) -> bytes:
     """
     Excelファイルを受け取り、各シートを個別のExcelファイルに分割し、
     それらをZipバイト列として返す。元の書式設定を保持する。
+    - 数式セルは『計算済みの表示値』に固定（キャッシュが無ければ数式文字列をプレーンテキスト化）
+    - 削除/非表示/不正なシートは除外
     Args:
         file: BytesIOまたはアップロードファイルオブジェクト
     Returns:
@@ -31,81 +47,104 @@ def split_excel_to_zip(file) -> bytes:
         ValueError: Excelファイルが不正な場合
     """
     try:
-        # openpyxlでワークブックを読み込み
+        # ファイルをバイトに確定させ、2回読み込めるようにする
         if hasattr(file, 'read'):
-            # ファイルオブジェクトの場合
-            workbook = load_workbook(file)
+            bytes_data = file.read()
         else:
-            # バイトデータの場合
-            workbook = load_workbook(io.BytesIO(file))
+            bytes_data = file if isinstance(file, (bytes, bytearray)) else bytes(file)
+
+        # 値読み込み（data_only=True）→ 数式セルは計算結果（キャッシュ値）を取得
+        workbook_values = load_workbook(io.BytesIO(bytes_data), data_only=True)
+        # 数式読み込み（data_only=False）→ 数式の有無判定に使用
+        workbook_formulas = load_workbook(io.BytesIO(bytes_data), data_only=False)
     except Exception as e:
         raise ValueError(f"Excelファイルの読み込みに失敗しました: {e}")
 
-    sheet_names = workbook.sheetnames
-    if not sheet_names:
-        raise ValueError("シートが見つかりませんでした。")
+    # 実在し処理対象のワークシート収集
+    from openpyxl.worksheet.worksheet import Worksheet
+    valid_worksheets = []
+    excluded_sheets = []
+
+    # タイトル→Worksheet（数式側）対応表
+    title_to_ws_formula = {ws.title: ws for ws in workbook_formulas.worksheets}
+
+    for ws in workbook_values.worksheets:
+        try:
+            if not isinstance(ws, Worksheet):
+                excluded_sheets.append(f"{getattr(ws, 'title', 'Unknown')} (Worksheet型ではない)")
+                continue
+            if not hasattr(ws, 'title') or not ws.title:
+                excluded_sheets.append("(無題/タイトル欠落)")
+                continue
+
+            state_value = getattr(ws, 'sheet_state', getattr(ws, 'state', None))
+            if state_value in ("veryHidden", "hidden"):
+                excluded_sheets.append(f"{ws.title} (非表示シート: {state_value})")
+                continue
+
+            if not hasattr(ws, 'max_row') or not hasattr(ws, 'max_column'):
+                excluded_sheets.append(f"{ws.title} (寸法属性欠落)")
+                continue
+
+            _ = ws.cell(row=1, column=1)
+
+            valid_worksheets.append(ws)
+        except Exception as e:
+            excluded_sheets.append(f"{getattr(ws, 'title', 'Unknown')} (アクセス失敗: {e})")
+            continue
+
+    if excluded_sheets:
+        print(f"除外されたシート: {', '.join(excluded_sheets)}")
+    print(f"対象シート: {[ws.title for ws in valid_worksheets]}")
+
+    if not valid_worksheets:
+        raise ValueError("有効なシートが見つかりませんでした。")
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zipf:
-        for sheet_name in sheet_names:
+        for ws_values in valid_worksheets:
+            sheet_name = ws_values.title
             try:
-                # 元のシートを取得
-                original_sheet = workbook[sheet_name]
-                
-                # 新しいワークブックを作成
-                new_workbook = Workbook()
-                new_workbook.remove(new_workbook.active)  # デフォルトシートを削除
-                
-                # 新しいシートを作成（元のシート名を使用）
-                new_sheet = new_workbook.create_sheet(title=sheet_name)
-                
-                # データと書式をコピー
-                for row in original_sheet.iter_rows():
-                    for cell in row:
-                        new_cell = new_sheet.cell(row=cell.row, column=cell.column)
-                        new_cell.value = cell.value
-                        
-                        # 書式設定をコピー（StyleProxyエラーを回避）
-                        if cell.has_style:
-                            if cell.font:
-                                new_cell.font = copy(cell.font)
-                            if cell.border:
-                                new_cell.border = copy(cell.border)
-                            if cell.fill:
-                                new_cell.fill = copy(cell.fill)
-                            if cell.number_format:
-                                new_cell.number_format = cell.number_format
-                            if cell.protection:
-                                new_cell.protection = copy(cell.protection)
-                            if cell.alignment:
-                                new_cell.alignment = copy(cell.alignment)
-                
-                # 列幅をコピー
-                for column in original_sheet.column_dimensions:
-                    if column in original_sheet.column_dimensions:
-                        new_sheet.column_dimensions[column] = original_sheet.column_dimensions[column]
-                
-                # 行高をコピー
-                for row in original_sheet.row_dimensions:
-                    if row in original_sheet.row_dimensions:
-                        new_sheet.row_dimensions[row] = original_sheet.row_dimensions[row]
-                
-                # マージされたセルをコピー
-                for merged_range in original_sheet.merged_cells.ranges:
-                    new_sheet.merge_cells(str(merged_range))
-                
-                # シートをバイトデータとして保存
+                # 各シート処理ごとにワークブックを再読込（体裁を完全保持するため）
+                wb_vals = load_workbook(io.BytesIO(bytes_data), data_only=True)
+                wb_form = load_workbook(io.BytesIO(bytes_data), data_only=False)
+
+                if sheet_name not in wb_form.sheetnames or sheet_name not in wb_vals.sheetnames:
+                    raise ValueError(f"シートが見つかりません: {sheet_name}")
+
+                ws_v = wb_vals[sheet_name]
+                ws_f = wb_form[sheet_name]
+
+                # 数式をその場で値に置換（対象シートのみ）
+                for row in ws_f.iter_rows():
+                    for cell_f in row:
+                        cell_v = ws_v.cell(row=cell_f.row, column=cell_f.column)
+                        if _is_formula_cell(cell_f):
+                            evaluated = cell_v.value
+                            if evaluated is None:
+                                formula_text = cell_f.value if isinstance(cell_f.value, str) else ""
+                                cell_f.value = "'" + str(formula_text)
+                            else:
+                                cell_f.value = evaluated
+
+                # 対象シート以外を削除
+                for other in list(wb_form.sheetnames):
+                    if other != sheet_name:
+                        ws_del = wb_form[other]
+                        # veryHidden/hidden等も含めて削除
+                        wb_form.remove(ws_del)
+
+                # 保存
                 sheet_buffer = io.BytesIO()
-                new_workbook.save(sheet_buffer)
+                wb_form.save(sheet_buffer)
                 sheet_buffer.seek(0)
-                
-                # ZIPに追加
+
                 sheet_filename = sanitize_sheet_name(sheet_name) + ".xlsx"
                 zipf.writestr(sheet_filename, sheet_buffer.getvalue())
-                
+
             except Exception as e:
                 raise ValueError(f"シート '{sheet_name}' の処理中にエラー: {e}")
-    
+
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
 
